@@ -7,21 +7,21 @@ const wss = new WebSocket.Server({ port });
 
 console.log("Single-Channel Signaling Server running on port " + port);
 
-// ALWAYS use this room (one shared channel)
+// Fixed room (single channel radio)
 const ROOM = "team-radio";
 
 const rooms = { [ROOM]: new Set() };
 
 wss.on("connection", (ws) => {
   ws.room = ROOM;
-  ws.id = Math.random().toString(36).slice(2, 10);
+  ws.id = Math.random().toString(36).slice(2, 10); // random ID
 
-  // Inform existing peers
+  // notify existing peers
   rooms[ROOM].forEach(peer =>
     peer.send(JSON.stringify({ type: "peer-joined", id: ws.id }))
   );
 
-  // Send back list of existing connected peers
+  // send existing peers to the new user
   ws.send(JSON.stringify({
     type: "peers",
     id: ws.id,
