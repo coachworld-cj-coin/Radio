@@ -1,0 +1,274 @@
+<!-- widget.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Team Radio</title>
+  <style>
+    :root { --bg:#0b1220; --card:#0f1724; --accent:#2dd4bf; color: #e6eef6; }
+    body{ margin:0; font-family: Inter, system-ui, sans-serif; background:var(--bg); color:inherit; }
+    .card{ padding:12px; border-radius:10px; background:var(--card); margin:12px; box-shadow:0 6px 18px rgba(0,0,0,.4);}
+    .header{display:flex;gap:8px;align-items:center;justify-content:space-between;}
+    button{ background:var(--accent); color:#042f2b; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;}
+    .muted{opacity:.5}
+    .participant{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03)}
+    .name{font-weight:600}
+    .controls{display:flex;gap:8px;align-items:center}
+  </style>
+</head>
+<body>
+  <div class="card" id="app" style="max-width:420px;">
+    <div class="header">
+      <div>
+        <div style="font-size:16px;font-weight:700">Team Radio</div>
+        <div style="font-size:12px; opacity:.7" id="roomLabel">room: —</div>
+      </div>
+      <div class="controls">
+        <button id="connectBtn">Connect</button>
+      </div>
+    </div>
+
+    <div style="margin-top:10px">
+      <div style="display:flex;gap:8px;align-items:center">
+        <button id="pttBtn">Push-to-talk (Hold)</button>
+        <button id="muteBtn">Mute</button>
+      </div>
+      <div style="margin-top:10px">
+        <div style="font-size:13px; color:rgba(255,255,255,.7)">Participants</div>
+        <div id="peersList" style="margin-top:8px"></div>
+      </div>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:rgba(255,255,255,.6)">
+      Use push-to-talk (hold) to transmit. Allow microphone when the browser asks.
+    </div>
+  </div>
+
+<script>
+(() => {
+  const urlParams = new URLSearchParams(location.search);
+  const room = urlParams.get('room') || 'default-room';
+  const serverUrl = urlParams.get('server') || (location.origin.replace(/^http/,'ws'));
+  const app = document.getElementById('app');
+  document.getElementById('roomLabel').textContent = 'room: ' + room;
+
+  let pcById = {}; // peerId -> RTCPeerConnection
+  let sendersById = {}; // peerId -> RTCRtpSender
+  let remoteAudioEls = {}; // peerId -> <audio>
+  let localStream = null;
+  let ws = null;
+  let myId = null;
+  let connected = false;
+  let isMuted = false;
+  let pttHeld = false;
+
+  const peersList = document.getElementById('peersList');
+  const connectBtn = document.getElementById('connectBtn');
+  const pttBtn = document.getElementById('pttBtn');
+  const muteBtn = document.getElementById('muteBtn');
+
+  function addPeerRow(id) {
+    if (document.getElementById('peer-'+id)) return;
+    const div = document.createElement('div');
+    div.className = 'participant';
+    div.id = 'peer-'+id;
+    div.innerHTML = `<div style="width:10px;height:10px;border-radius:50%;background:#10b981"></div>
+                     <div class="name">${id}${id===myId?' (you)':''}</div>
+                     <div style="margin-left:auto;font-size:12px;opacity:.8" id="vol-${id}">listening</div>`;
+    peersList.appendChild(div);
+  }
+  function removePeerRow(id) {
+    const el = document.getElementById('peer-'+id);
+    if (el) el.remove();
+    if (remoteAudioEls[id]) {
+      remoteAudioEls[id].pause();
+      delete remoteAudioEls[id];
+    }
+  }
+
+  async function openMic() {
+    if (localStream) return;
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate:16000 } });
+    // Start muted by default: disable track
+    localStream.getAudioTracks().forEach(t => t.enabled = false);
+  }
+
+  function sendWs(msg) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(msg));
+  }
+
+  async function start() {
+    if (connected) return;
+    await openMic();
+    ws = new WebSocket(serverUrl);
+    ws.addEventListener('open', () => {
+      sendWs({ type:'join', room, payload:{ }});
+    });
+    ws.addEventListener('message', async (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'peers') {
+        myId = msg.id;
+        addPeerRow(myId);
+        // create offers to existing peers
+        for (const peerId of msg.peers || []) {
+          createOffer(peerId);
+          addPeerRow(peerId);
+        }
+        connected = true;
+        connectBtn.textContent = 'Disconnect';
+      } else if (msg.type === 'peer-joined') {
+        const id = msg.id;
+        addPeerRow(id);
+        // we create offer to the new peer
+        createOffer(id);
+      } else if (msg.type === 'offer') {
+        const from = msg.from;
+        await handleOffer(from, msg.payload);
+      } else if (msg.type === 'answer') {
+        const from = msg.from;
+        const pc = pcById[from];
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+        }
+      } else if (msg.type === 'ice') {
+        const from = msg.from;
+        const pc = pcById[from];
+        if (pc) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(msg.payload)); }
+          catch(e){}
+        }
+      } else if (msg.type === 'peer-left') {
+        removePeer(msg.id);
+      }
+    });
+  }
+
+  function removePeer(id) {
+    if (pcById[id]) {
+      pcById[id].close();
+      delete pcById[id];
+    }
+    removePeerRow(id);
+  }
+
+  async function createOffer(peerId) {
+    if (!localStream) await openMic();
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+    pcById[peerId] = pc;
+
+    // send local track(s)
+    localStream.getTracks().forEach(track => {
+      const sender = pc.addTrack(track, localStream);
+      sendersById[peerId] = sendersById[peerId] || [];
+      sendersById[peerId].push(sender);
+    });
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        sendWs({ type:'ice', room, payload:{ target: peerId, data: e.candidate }});
+      }
+    };
+
+    pc.ontrack = (ev) => {
+      // create audio element to play remote audio
+      if (!remoteAudioEls[peerId]) {
+        const a = document.createElement('audio');
+        a.autoplay = true;
+        a.srcObject = ev.streams[0];
+        // small UI marker
+        const volEl = document.getElementById('vol-'+peerId);
+        if (volEl) volEl.textContent = 'speaking';
+        remoteAudioEls[peerId] = a;
+      } else {
+        remoteAudioEls[peerId].srcObject = ev.streams[0];
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendWs({ type:'offer', room, payload:{ target: peerId, data: offer }});
+  }
+
+  async function handleOffer(fromId, offer) {
+    if (!localStream) await openMic();
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+    pcById[fromId] = pc;
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        sendWs({ type:'ice', room, payload:{ target: fromId, data: e.candidate }});
+      }
+    };
+    pc.ontrack = (ev) => {
+      if (!remoteAudioEls[fromId]) {
+        const a = document.createElement('audio');
+        a.autoplay = true;
+        a.srcObject = ev.streams[0];
+        remoteAudioEls[fromId] = a;
+      } else {
+        remoteAudioEls[fromId].srcObject = ev.streams[0];
+      }
+    };
+
+    // add our local tracks
+    localStream.getTracks().forEach(track => {
+      const sender = pc.addTrack(track, localStream);
+      sendersById[fromId] = sendersById[fromId] || [];
+      sendersById[fromId].push(sender);
+    });
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    sendWs({ type:'answer', room, payload:{ target: fromId, data: answer }});
+  }
+
+  // Push-to-talk: enable audio tracks while PTT held
+  function setTransmit(enabled) {
+    if (!localStream) return;
+    localStream.getAudioTracks().forEach(t => t.enabled = enabled && !isMuted);
+    // small UI update
+    pttBtn.style.background = enabled ? '#ef4444' : '';
+  }
+
+  // UI handlers
+  connectBtn.addEventListener('click', async () => {
+    if (!connected) {
+      await start();
+    } else {
+      // disconnect
+      ws && ws.close();
+      connected = false;
+      connectBtn.textContent = 'Connect';
+      // cleanup
+      Object.keys(pcById).forEach(k => { pcById[k].close(); delete pcById[k]; });
+      peersList.innerHTML = '';
+    }
+  });
+
+  pttBtn.addEventListener('mousedown', () => { pttHeld = true; setTransmit(true); });
+  pttBtn.addEventListener('touchstart', () => { pttHeld = true; setTransmit(true); });
+  pttBtn.addEventListener('mouseup', () => { pttHeld = false; setTransmit(false); });
+  pttBtn.addEventListener('mouseleave', () => { if(pttHeld){ pttHeld=false; setTransmit(false);} });
+  pttBtn.addEventListener('touchend', () => { pttHeld = false; setTransmit(false); });
+
+  muteBtn.addEventListener('click', () => {
+    isMuted = !isMuted;
+    muteBtn.textContent = isMuted ? 'Muted' : 'Mute';
+    if (!pttHeld) setTransmit(false); // ensure disabled if muted
+    muteBtn.classList.toggle('muted', isMuted);
+  });
+
+  // auto-connect if iframe query param has autoconnect=1
+  if (urlParams.get('autoconnect') === '1') {
+    start();
+  }
+})();
+</script>
+</body>
+</html>
