@@ -1,5 +1,5 @@
 {
-  "name": "team-radio-signaling-server",
+  "name": "single-channel-team-radio",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
